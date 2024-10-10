@@ -173,6 +173,7 @@ impl<'a> Collector<'a, '_, '_> {
     fn block(&mut self, elem: &'a Packed<BlockElem>, styles: StyleChain<'a>) {
         let locator = self.locator.next(&elem.span());
         let align = AlignElem::alignment_in(styles).resolve(styles);
+        let alone = self.children.len() == 1;
         let sticky = elem.sticky(styles);
         let breakable = elem.breakable(styles);
         let fr = match elem.height(styles) {
@@ -189,10 +190,11 @@ impl<'a> Collector<'a, '_, '_> {
 
         self.output.push(spacing(elem.above(styles)));
 
-        if !breakable || sticky || fr.is_some() {
+        if !breakable || fr.is_some() {
             self.output.push(Child::Single(self.boxed(SingleChild {
                 align,
                 sticky,
+                alone,
                 fr,
                 elem,
                 styles,
@@ -200,9 +202,9 @@ impl<'a> Collector<'a, '_, '_> {
                 cell: CachedCell::new(),
             })));
         } else {
-            let alone = self.children.len() == 1;
             self.output.push(Child::Multi(self.boxed(MultiChild {
                 align,
+                sticky,
                 alone,
                 elem,
                 styles,
@@ -317,6 +319,7 @@ pub struct LineChild {
 pub struct SingleChild<'a> {
     pub align: Axes<FixedAlignment>,
     pub sticky: bool,
+    pub alone: bool,
     pub fr: Option<Fr>,
     elem: &'a Packed<BlockElem>,
     styles: StyleChain<'a>,
@@ -326,8 +329,10 @@ pub struct SingleChild<'a> {
 
 impl SingleChild<'_> {
     /// Build the child's frame given the region's base size.
-    pub fn layout(&self, engine: &mut Engine, base: Size) -> SourceResult<Frame> {
-        self.cell.get_or_init(base, |base| {
+    pub fn layout(&self, engine: &mut Engine, region: Region) -> SourceResult<Frame> {
+        self.cell.get_or_init(region, |mut region| {
+            // Vertical expansion is only kept if this block is the only child.
+            region.expand.y &= self.alone;
             layout_single_impl(
                 engine.world,
                 engine.introspector,
@@ -337,7 +342,7 @@ impl SingleChild<'_> {
                 self.elem,
                 self.locator.track(),
                 self.styles,
-                base,
+                region,
             )
         })
     }
@@ -355,7 +360,7 @@ fn layout_single_impl(
     elem: &Packed<BlockElem>,
     locator: Tracked<Locator>,
     styles: StyleChain,
-    base: Size,
+    region: Region,
 ) -> SourceResult<Frame> {
     let link = LocatorLink::new(locator);
     let locator = Locator::link(&link);
@@ -367,7 +372,7 @@ fn layout_single_impl(
         route: Route::extend(route),
     };
 
-    elem.layout_single(&mut engine, locator, styles, base)
+    elem.layout_single(&mut engine, locator, styles, region)
         .map(|frame| frame.post_processed(styles))
 }
 
@@ -375,6 +380,7 @@ fn layout_single_impl(
 #[derive(Debug)]
 pub struct MultiChild<'a> {
     pub align: Axes<FixedAlignment>,
+    pub sticky: bool,
     alone: bool,
     elem: &'a Packed<BlockElem>,
     styles: StyleChain<'a>,
@@ -403,6 +409,7 @@ impl<'a> MultiChild<'a> {
                 full: regions.full,
                 first: regions.size.y,
                 backlog: vec![],
+                min_backlog_len: regions.backlog.len(),
             });
         }
 
@@ -474,6 +481,7 @@ pub struct MultiSpill<'a, 'b> {
     first: Abs,
     full: Abs,
     backlog: Vec<Abs>,
+    min_backlog_len: usize,
 }
 
 impl MultiSpill<'_, '_> {
@@ -483,17 +491,18 @@ impl MultiSpill<'_, '_> {
         engine: &mut Engine,
         regions: Regions,
     ) -> SourceResult<(Frame, Option<Self>)> {
-        // We build regions for the whole `MultiChild` with the sizes passed to
-        // earlier parts of it plus the new regions. Then, we layout the
-        // complete block, but extract only the suffix that interests us.
+        // The first region becomes unchangable and committed to our backlog.
         self.backlog.push(regions.size.y);
 
+        // The remaining regions are ephemeral and may be replaced.
         let mut backlog: Vec<_> =
             self.backlog.iter().chain(regions.backlog).copied().collect();
 
-        // Remove unnecessary backlog items (also to prevent it from growing
-        // unnecessarily, which would change the region's hash).
-        while !backlog.is_empty() && backlog.last().copied() == regions.last {
+        // Remove unnecessary backlog items to prevent it from growing
+        // unnecessarily, changing the region's hash.
+        while backlog.len() > self.min_backlog_len
+            && backlog.last().copied() == regions.last
+        {
             backlog.pop();
         }
 
@@ -512,6 +521,16 @@ impl MultiSpill<'_, '_> {
             .layout_full(engine, pod)?
             .into_iter()
             .skip(self.backlog.len());
+
+        // Ensure that the backlog never shrinks, so that unwrapping below is at
+        // least fairly safe. Note that the whole region juggling here is
+        // fundamentally not ideal: It is a compatibility layer between the old
+        // (all regions provided upfront) & new (each region provided on-demand,
+        // like an iterator) layout model. This approach is not 100% correct, as
+        // in the old model later regions could have an effect on earlier
+        // frames, but it's the best we can do for now, until the multi
+        // layouters are refactored to the new model.
+        self.min_backlog_len = self.min_backlog_len.max(backlog.len());
 
         // Save the first frame.
         let frame = frames.next().unwrap();

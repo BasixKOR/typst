@@ -9,6 +9,8 @@ pub use self::contribs::*;
 pub use self::html::*;
 pub use self::model::*;
 
+use std::collections::HashSet;
+
 use ecow::{eco_format, EcoString};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -245,6 +247,19 @@ fn category_page(resolver: &dyn Resolver, category: Category) -> PageModel {
         shorthands = Some(ShorthandsModel { markup, math });
     }
 
+    let mut skip = HashSet::new();
+    if category == MATH {
+        skip = GROUPS
+            .iter()
+            .filter(|g| g.category == category.name())
+            .flat_map(|g| &g.filter)
+            .map(|s| s.as_str())
+            .collect();
+
+        // Already documented in the text category.
+        skip.insert("text");
+    }
+
     // Add values and types.
     let scope = module.scope();
     for (name, value, _) in scope.iter() {
@@ -252,16 +267,8 @@ fn category_page(resolver: &dyn Resolver, category: Category) -> PageModel {
             continue;
         }
 
-        if category == MATH {
-            // Skip grouped functions.
-            if GROUPS.iter().flat_map(|group| &group.filter).any(|f| f == name) {
-                continue;
-            }
-
-            // Already documented in the text category.
-            if name == "text" {
-                continue;
-            }
+        if skip.contains(name.as_str()) {
+            continue;
         }
 
         match value {

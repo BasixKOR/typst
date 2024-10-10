@@ -1,8 +1,7 @@
 use std::num::NonZeroUsize;
 
-use ecow::EcoString;
 use typst::layout::{Frame, FrameItem, Point, Position, Size};
-use typst::model::{Destination, Document};
+use typst::model::{Destination, Document, Url};
 use typst::syntax::{FileId, LinkedNode, Side, Source, Span, SyntaxKind};
 use typst::visualize::Geometry;
 use typst::World;
@@ -13,7 +12,7 @@ pub enum Jump {
     /// Jump to a position in a source file.
     Source(FileId, usize),
     /// Jump to an external URL.
-    Url(EcoString),
+    Url(Url),
     /// Jump to a point on a page.
     Position(Position),
 }
@@ -206,7 +205,7 @@ mod tests {
 
     macro_rules! assert_approx_eq {
         ($l:expr, $r:expr) => {
-            assert!(($l.to_raw() - $r.to_raw()).abs() < 0.1, "{:?} ≉ {:?}", $l, $r);
+            assert!(($l - $r).abs() < Abs::pt(0.1), "{:?} ≉ {:?}", $l, $r);
         };
     }
 

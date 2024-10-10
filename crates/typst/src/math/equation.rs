@@ -17,7 +17,7 @@ use crate::layout::{
 use crate::math::{
     scaled_font_size, MathContext, MathRunFrameBuilder, MathSize, MathVariant,
 };
-use crate::model::{Numbering, Outlinable, ParElem, Refable, Supplement};
+use crate::model::{Numbering, Outlinable, ParElem, ParLine, Refable, Supplement};
 use crate::syntax::Span;
 use crate::text::{
     families, variant, Font, FontFamily, FontList, FontWeight, LocalName, TextElem,
@@ -180,6 +180,7 @@ impl ShowSet for Packed<EquationElem> {
         if self.block(styles) {
             out.set(AlignElem::set_alignment(Alignment::CENTER));
             out.set(BlockElem::set_breakable(false));
+            out.set(ParLine::set_numbering(None));
             out.set(EquationElem::set_size(MathSize::Display));
         } else {
             out.set(EquationElem::set_size(MathSize::Text));
@@ -322,15 +323,14 @@ fn layout_equation_block(
         .layout_into_run(&elem.body, styles)?
         .multiline_frame_builder(&ctx, styles);
     let width = full_equation_builder.size.x;
-    let can_break =
-        BlockElem::breakable_in(styles) && full_equation_builder.frames.len() > 1;
 
-    let equation_builders = if can_break {
+    let equation_builders = if BlockElem::breakable_in(styles) {
         let mut rows = full_equation_builder.frames.into_iter().peekable();
         let mut equation_builders = vec![];
         let mut last_first_pos = Point::zero();
+        let mut regions = regions;
 
-        for region in regions.iter() {
+        loop {
             // Keep track of the position of the first row in this region,
             // so that the offset can be reverted later.
             let Some(&(_, first_pos)) = rows.peek() else { break };
@@ -346,8 +346,9 @@ fn layout_equation_block(
                 // we placed at least one line _or_ we still have non-last
                 // regions. Crucially, we don't want to infinitely create
                 // new regions which are too small.
-                if !region.y.fits(sub.height() + pos.y)
-                    && (!frames.is_empty() || !regions.in_last())
+                if !regions.size.y.fits(sub.height() + pos.y)
+                    && (regions.may_progress()
+                        || (regions.may_break() && !frames.is_empty()))
                 {
                     break;
                 }
@@ -359,6 +360,7 @@ fn layout_equation_block(
 
             equation_builders
                 .push(MathRunFrameBuilder { frames, size: Size::new(width, height) });
+            regions.next();
         }
 
         // Append remaining rows to the equation builder of the last region.
@@ -376,6 +378,12 @@ fn layout_equation_block(
                 .unwrap_or(equation_builder.size.y);
 
             equation_builder.size.y = height;
+        }
+
+        // Ensure that there is at least one frame, even for empty equations.
+        if equation_builders.is_empty() {
+            equation_builders
+                .push(MathRunFrameBuilder { frames: vec![], size: Size::zero() });
         }
 
         equation_builders

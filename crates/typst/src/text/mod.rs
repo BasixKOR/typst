@@ -31,6 +31,10 @@ pub use self::space::*;
 use std::fmt::{self, Debug, Formatter};
 
 use ecow::{eco_format, EcoString};
+use icu_properties::sets::CodePointSetData;
+use icu_provider::AsDeserializingBufferProvider;
+use icu_provider_blob::BlobDataProvider;
+use once_cell::sync::Lazy;
 use rustybuzz::Feature;
 use smallvec::SmallVec;
 use ttf_parser::{Rect, Tag};
@@ -105,7 +109,7 @@ pub struct TextElem {
     ///   automatically. The priority is: project fonts > server fonts.
     ///
     /// - Locally, Typst uses your installed system fonts or embedded fonts in
-    ///   the CLI, which are `Linux Libertine`, `New Computer Modern`,
+    ///   the CLI, which are `Libertinus Serif`, `New Computer Modern`,
     ///   `New Computer Modern Math`, and `DejaVu Sans Mono`. In addition, you
     ///   can use the `--font-path` argument or `TYPST_FONT_PATHS` environment
     ///   variable to add directories that should be scanned for fonts. The
@@ -128,21 +132,12 @@ pub struct TextElem {
     /// ```
     #[parse({
         let font_list: Option<Spanned<FontList>> = args.named("font")?;
-        if let Some(font_list) = &font_list {
-            let book = engine.world.book();
-            for family in &font_list.v {
-                if !book.contains_family(family.as_str()) {
-                    engine.sink.warn(warning!(
-                        font_list.span,
-                        "unknown font family: {}",
-                        family.as_str(),
-                    ));
-                }
-            }
+        if let Some(list) = &font_list {
+            check_font_list(engine, list);
         }
         font_list.map(|font_list| font_list.v)
     })]
-    #[default(FontList(vec![FontFamily::new("Linux Libertine")]))]
+    #[default(FontList(vec![FontFamily::new("Libertinus Serif")]))]
     #[borrowed]
     #[ghost]
     pub font: FontList,
@@ -182,7 +177,7 @@ pub struct TextElem {
     /// change your mind about how to signify the emphasis.
     ///
     /// ```example
-    /// #text(font: "Linux Libertine", style: "italic")[Italic]
+    /// #text(font: "Libertinus Serif", style: "italic")[Italic]
     /// #text(font: "DejaVu Sans", style: "oblique")[Oblique]
     /// ```
     #[ghost]
@@ -418,7 +413,7 @@ pub struct TextElem {
     ///
     /// ```example
     /// #set text(
-    ///   font: "Linux Libertine",
+    ///   font: "Libertinus Serif",
     ///   size: 20pt,
     /// )
     ///
@@ -821,7 +816,7 @@ cast! {
 /// Resolve a prioritized iterator over the font families.
 pub(crate) fn families(styles: StyleChain) -> impl Iterator<Item = &str> + Clone {
     const FALLBACKS: &[&str] = &[
-        "linux libertine",
+        "libertinus serif",
         "twitter color emoji",
         "noto color emoji",
         "apple color emoji",
@@ -1319,6 +1314,20 @@ cast! {
     },
 }
 
+/// Whether a codepoint is Unicode `Default_Ignorable`.
+pub(crate) fn is_default_ignorable(c: char) -> bool {
+    /// The set of Unicode default ignorables.
+    static DEFAULT_IGNORABLE_DATA: Lazy<CodePointSetData> = Lazy::new(|| {
+        icu_properties::sets::load_default_ignorable_code_point(
+            &BlobDataProvider::try_new_from_static_blob(typst_assets::icu::ICU)
+                .unwrap()
+                .as_deserializing(),
+        )
+        .unwrap()
+    });
+    DEFAULT_IGNORABLE_DATA.as_borrowed().contains(c)
+}
+
 /// Pushes `text` wrapped in LRE/RLE + PDF to `out`.
 pub(crate) fn isolate(text: Content, styles: StyleChain, out: &mut Vec<Content>) {
     out.push(TextElem::packed(match TextElem::dir_in(styles) {
@@ -1327,4 +1336,35 @@ pub(crate) fn isolate(text: Content, styles: StyleChain, out: &mut Vec<Content>)
     }));
     out.push(text);
     out.push(TextElem::packed("\u{202C}"));
+}
+
+/// Checks for font families that are not available.
+fn check_font_list(engine: &mut Engine, list: &Spanned<FontList>) {
+    let book = engine.world.book();
+    for family in &list.v {
+        let found = book.contains_family(family.as_str());
+        if family.as_str() == "linux libertine" {
+            let mut warning = warning!(
+                list.span,
+                "Typst's default font has changed from Linux Libertine to its successor Libertinus Serif";
+                hint: "please set the font to `\"Libertinus Serif\"` instead"
+            );
+
+            if found {
+                warning.hint(
+                    "Linux Libertine is available on your system - \
+                     you can ignore this warning if you are sure you want to use it",
+                );
+                warning.hint("this warning will be removed in Typst 0.13");
+            }
+
+            engine.sink.warn(warning);
+        } else if !found {
+            engine.sink.warn(warning!(
+                list.span,
+                "unknown font family: {}",
+                family.as_str(),
+            ));
+        }
+    }
 }

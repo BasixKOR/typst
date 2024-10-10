@@ -194,9 +194,9 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
     /// Processes a line of a paragraph.
     fn line(&mut self, line: &'b LineChild) -> FlowResult<()> {
-        // If the line doesn't fit and we're allowed to break, finish the
-        // region.
-        if !self.regions.size.y.fits(line.frame.height()) && !self.regions.in_last() {
+        // If the line doesn't fit and a followup region may improve things,
+        // finish the region.
+        if !self.regions.size.y.fits(line.frame.height()) && self.regions.may_progress() {
             return Err(Stop::Finish(false));
         }
 
@@ -226,11 +226,14 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         }
 
         // Lay out the block.
-        let frame = single.layout(self.composer.engine, self.regions.base())?;
+        let frame = single.layout(
+            self.composer.engine,
+            Region::new(self.regions.base(), self.regions.expand),
+        )?;
 
-        // If the block doesn't fit and we're allowed to break, finish the
-        // region.
-        if !self.regions.size.y.fits(frame.height()) && !self.regions.in_last() {
+        // If the block doesn't fit and a followup region may improve things,
+        // finish the region.
+        if !self.regions.size.y.fits(frame.height()) && self.regions.may_progress() {
             return Err(Stop::Finish(false));
         }
 
@@ -247,7 +250,7 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
         // Lay out the block.
         let (frame, spill) = multi.layout(self.composer.engine, self.regions)?;
-        self.frame(frame, multi.align, false, true)?;
+        self.frame(frame, multi.align, multi.sticky, true)?;
 
         // If the block didn't fully fit into the current region, save it into
         // the `spill` and finish the region.
@@ -292,9 +295,9 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         breakable: bool,
     ) -> FlowResult<()> {
         if sticky {
-            // If the frame is sticky and we haven't remember a preceding sticky
-            // element, make a checkpoint which we can restore should we end on
-            // this sticky element.
+            // If the frame is sticky and we haven't remembered a preceding
+            // sticky element, make a checkpoint which we can restore should we
+            // end on this sticky element.
             if self.stickable && self.sticky.is_none() {
                 self.sticky = Some(self.snapshot());
             }
@@ -422,8 +425,8 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             for item in &self.items {
                 let Item::Fr(v, Some(single)) = item else { continue };
                 let length = v.share(frs, fr_space);
-                let base = Size::new(region.size.x, length);
-                let frame = single.layout(self.composer.engine, base)?;
+                let pod = Region::new(Size::new(region.size.x, length), region.expand);
+                let frame = single.layout(self.composer.engine, pod)?;
                 used.x.set_max(frame.width());
                 fr_frames.push(frame);
             }

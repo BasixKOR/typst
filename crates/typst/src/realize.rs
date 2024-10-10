@@ -873,38 +873,39 @@ const fn list_like_grouping<T: ListLike>() -> GroupingRule {
 ///   as part of a paragraph grouping,
 /// - if that's not possible because another grouping is active, temporarily
 ///   disables textual grouping and revisits the elements.
-fn finish_textual(Grouped { s, start }: Grouped) -> SourceResult<()> {
-    // Try to find a regex match in the grouped textual elements.
+fn finish_textual(Grouped { s, mut start }: Grouped) -> SourceResult<()> {
+    // Try to find a regex match in the grouped textual elements. Returns early
+    // if there is one.
     if visit_textual(s, start)? {
         return Ok(());
     }
 
-    // No regex match.
-    match s.groupings.last() {
-        // Transparently apply the grouped content to an active paragraph. This
-        // is more efficient than revisiting everything. Checking the priority
-        // is a bit of a hack, but the simplest way to check which rule is
-        // active for now.
-        Some(grouping) if std::ptr::eq(grouping.rule, &PAR) => {}
+    // There was no regex match, so we need to collect the text into a paragraph
+    // grouping. To do that, we first terminate all non-paragraph groupings.
+    if in_non_par_grouping(s) {
+        let elems = s.store_slice(&s.sink[start..]);
+        s.sink.truncate(start);
+        finish_grouping_while(s, in_non_par_grouping)?;
+        start = s.sink.len();
+        s.sink.extend(elems);
+    }
 
-        // Start a new paragraph based on this textual group.
-        None => s.groupings.push(Grouping { rule: &PAR, start }),
-
-        // If a non-paragraph grouping is top-level, revisit the grouped
-        // content with the `TEXTUAL` rule disabled.
-        _ => {
-            let elems = s.store_slice(&s.sink[start..]);
-            let rules = s.rules;
-            s.sink.truncate(start);
-            s.rules = &s.rules[1..];
-            for &(content, styles) in &elems {
-                visit(s, content, styles)?;
-            }
-            s.rules = rules;
-        }
+    // Now, there are only two options:
+    // 1. We are already in a paragraph group. In this case, the elements just
+    //    transparently become part of it.
+    // 2. There is no group at all. In this case, we create one.
+    if s.groupings.is_empty() {
+        s.groupings.push(Grouping { start, rule: &PAR });
     }
 
     Ok(())
+}
+
+/// Whether there is an active grouping, but it is not a `PAR` grouping.
+fn in_non_par_grouping(s: &State) -> bool {
+    s.groupings
+        .last()
+        .is_some_and(|grouping| !std::ptr::eq(grouping.rule, &PAR))
 }
 
 /// Builds the `ParElem` from inline-level elements.
@@ -1115,13 +1116,22 @@ fn visit_regex_match<'a>(
     elems: &[Pair<'a>],
     m: RegexMatch<'a>,
 ) -> SourceResult<()> {
-    let matched = m.offset..m.offset + m.text.len();
+    let match_range = m.offset..m.offset + m.text.len();
     let piece = TextElem::packed(m.text);
     let context = Context::new(None, Some(m.styles));
     let output = m.recipe.apply(s.engine, context.track(), piece)?;
 
-    let mut output = Some(output);
     let mut cursor = 0;
+    let mut output = Some(output);
+    let mut visit_unconsumed_match = |s: &mut State<'a, '_, '_, '_>| -> SourceResult<()> {
+        if let Some(output) = output.take() {
+            let revocation = Style::Revocation(m.id).into();
+            let outer = s.arenas.bump.alloc(m.styles);
+            let chained = outer.chain(s.arenas.styles.alloc(revocation));
+            visit(s, s.store(output), chained)?;
+        }
+        Ok(())
+    };
 
     for &(content, styles) in elems {
         // Just forward tags.
@@ -1130,47 +1140,48 @@ fn visit_regex_match<'a>(
             continue;
         }
 
-        // Determine the range of the element.
+        // At this point, we can have a `TextElem`, `SpaceElem`,
+        // `LinebreakElem`, or `SmartQuoteElem`. We now determine the range of
+        // the element.
         let len = content.to_packed::<TextElem>().map_or(1, |elem| elem.text.len());
-        let subrange = cursor..cursor + len;
+        let elem_range = cursor..cursor + len;
 
         // If the element starts before the start of match, visit it fully or
         // sliced.
-        if subrange.start < matched.start {
-            if subrange.end <= matched.start {
+        if elem_range.start < match_range.start {
+            if elem_range.end <= match_range.start {
                 visit(s, content, styles)?;
             } else {
                 let mut elem = content.to_packed::<TextElem>().unwrap().clone();
-                elem.text = elem.text[..matched.start - subrange.start].into();
+                elem.text = elem.text[..match_range.start - elem_range.start].into();
                 visit(s, s.store(elem.pack()), styles)?;
             }
         }
 
-        // When the match starts at or before this element ends, visit the
-        // match.
-        if matched.start <= subrange.end {
-            if let Some(output) = output.take() {
-                let revocation = Style::Revocation(m.id).into();
-                let outer = s.arenas.bump.alloc(m.styles);
-                let chained = outer.chain(s.arenas.styles.alloc(revocation));
-                visit(s, s.store(output), chained)?;
-            }
+        // When the match starts before this element ends, visit it.
+        if match_range.start < elem_range.end {
+            visit_unconsumed_match(s)?;
         }
 
         // If the element ends after the end of the match, visit if fully or
         // sliced.
-        if subrange.end > matched.end {
-            if subrange.start >= matched.end {
+        if elem_range.end > match_range.end {
+            if elem_range.start >= match_range.end {
                 visit(s, content, styles)?;
             } else {
                 let mut elem = content.to_packed::<TextElem>().unwrap().clone();
-                elem.text = elem.text[matched.end - subrange.start..].into();
+                elem.text = elem.text[match_range.end - elem_range.start..].into();
                 visit(s, s.store(elem.pack()), styles)?;
             }
         }
 
-        cursor = subrange.end;
+        cursor = elem_range.end;
     }
+
+    // If the match wasn't consumed yet, visit it. This shouldn't really happen
+    // in practice (we'd need to have an empty match at the end), but it's an
+    // extra fail-safe.
+    visit_unconsumed_match(s)?;
 
     Ok(())
 }
@@ -1230,9 +1241,5 @@ fn destruct_space(buf: &mut [Pair], end: &mut usize, state: &mut SpaceState) {
 
 /// Finds the first non-detached span in the list.
 fn select_span(children: &[Pair]) -> Span {
-    children
-        .iter()
-        .map(|(c, _)| c.span())
-        .find(|span| !span.is_detached())
-        .unwrap_or(Span::detached())
+    Span::find(children.iter().map(|(c, _)| c.span()))
 }
